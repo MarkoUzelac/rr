@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="hr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crypto Arbitrage Monitor</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui;background:#090d12;color:#e8eef5}
+body{margin:0;padding:24px;max-width:1200px;margin:auto}
+h1{font-size:clamp(24px,4vw,38px);margin:0 0 6px}.muted{color:#91a0b2}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:22px 0}
+.card,.panel{background:#131c26;border:1px solid #253447;border-radius:14px;padding:16px}
+.value{font-size:25px;font-weight:700;margin-top:8px;overflow-wrap:anywhere}
+button{border:1px solid #40566d;background:#1b2c3d;color:white;padding:10px 15px;border-radius:9px;margin-right:8px;cursor:pointer}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:11px 8px;border-bottom:1px solid #253447}
+.panel{margin-top:16px;overflow:auto}.good{color:#8ee3b3}.warn{color:#ffcc80}
+</style></head><body>
+<h1>Crypto Arbitrage Monitor</h1><div class="muted">Order-book scanner · PAPER mode · no live orders</div>
+<div style="margin-top:18px"><button onclick="act('pause')">Pause</button><button onclick="act('resume')">Resume</button></div>
+<div id="cards" class="grid"></div>
+<div class="panel"><h2>Spread observations</h2><table><thead><tr><th>Pair</th><th>Buy</th><th>Sell</th><th>Gross %</th><th>Net est. %</th><th>Est. profit</th><th>Mode</th></tr></thead><tbody id="rows"></tbody></table></div>
+<div class="panel"><h2>Events</h2><div id="events" class="muted">Loading…</div></div>
+<script>
+async function refresh(){
+const [s,o,e]=await Promise.all(['/api/status','/api/opportunities','/api/events'].map(u=>fetch(u).then(r=>r.json())));
+const cards=[['Mode',s.mode],['Exchanges',s.exchanges.join(', ')||'—'],['Pairs',s.symbols.join(', ')],['Scans',s.scan_count],['Candidates',s.opportunity_count],['Scanner',s.paused?'PAUSED':'RUNNING']];
+document.getElementById('cards').innerHTML=cards.map(([k,v])=>'<div class="card"><div class="muted">'+k+'</div><div class="value">'+v+'</div></div>').join('');
+document.getElementById('rows').innerHTML=o.map(r=>'<tr><td>'+r.symbol+'</td><td>'+r.buy_exchange+'</td><td>'+r.sell_exchange+'</td><td>'+r.gross_pct+'</td><td class="good">'+r.net_pct+'</td><td>'+r.estimated_net_quote+'</td><td>'+r.mode+'</td></tr>').join('')||'<tr><td colspan="7">No observations yet</td></tr>';
+document.getElementById('events').innerHTML=e.map(x=>'<div><b>'+x.level+'</b> '+x.created_at+' — '+x.message+'</div>').join('')||'No events';
+if(s.last_error) document.getElementById('events').innerHTML='<div class="warn">Last error: '+s.last_error+'</div>'+document.getElementById('events').innerHTML;
+}
+async function act(a){await fetch('/api/'+a,{method:'POST'});refresh()}
+refresh();setInterval(refresh,3000);
+</script></body></html>
