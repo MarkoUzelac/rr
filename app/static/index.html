@@ -18,13 +18,14 @@ table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;p
 <div class="panel"><h2>Spread observations</h2><table><thead><tr><th>Pair</th><th>Buy</th><th>Sell</th><th>Gross %</th><th>Net est. %</th><th>Est. profit</th><th>Mode</th></tr></thead><tbody id="rows"></tbody></table></div>
 <div class="panel"><h2>Events</h2><div id="events" class="muted">Loading…</div></div>
 <script>
+function safe(value){const span=document.createElement('span');span.textContent=String(value??'');return span.innerHTML}
 async function refresh(){
 const [s,o,e]=await Promise.all(['/api/status','/api/opportunities','/api/events'].map(u=>fetch(u).then(r=>r.json())));
-const cards=[['Mode',s.mode],['Exchanges',s.exchanges.join(', ')||'—'],['Pairs',s.symbols.join(', ')],['Scans',s.scan_count],['Candidates',s.opportunity_count],['Scanner',s.paused?'PAUSED':'RUNNING']];
-document.getElementById('cards').innerHTML=cards.map(([k,v])=>'<div class="card"><div class="muted">'+k+'</div><div class="value">'+v+'</div></div>').join('');
-document.getElementById('rows').innerHTML=o.map(r=>'<tr><td>'+r.symbol+'</td><td>'+r.buy_exchange+'</td><td>'+r.sell_exchange+'</td><td>'+r.gross_pct+'</td><td class="good">'+r.net_pct+'</td><td>'+r.estimated_net_quote+'</td><td>'+r.mode+'</td></tr>').join('')||'<tr><td colspan="7">No observations yet</td></tr>';
-document.getElementById('events').innerHTML=e.map(x=>'<div><b>'+x.level+'</b> '+x.created_at+' — '+x.message+'</div>').join('')||'No events';
-if(s.last_error) document.getElementById('events').innerHTML='<div class="warn">Last error: '+s.last_error+'</div>'+document.getElementById('events').innerHTML;
+const cards=[['Mode',s.mode],['Exchanges',s.exchanges.join(', ')||'—'],['Pairs',s.symbols.join(', ')],['Scans',s.scan_count],['Candidates',s.opportunity_count],['Scanner',s.paused?'PAUSED':'RUNNING'],['Min net edge',s.min_net_edge_pct+'%']];
+document.getElementById('cards').innerHTML=cards.map(([k,v])=>'<div class="card"><div class="muted">'+safe(k)+'</div><div class="value">'+safe(v)+'</div></div>').join('');
+document.getElementById('rows').innerHTML=o.map(r=>'<tr><td>'+safe(r.symbol)+'</td><td>'+safe(r.buy_exchange)+'</td><td>'+safe(r.sell_exchange)+'</td><td>'+safe(r.gross_pct)+'</td><td class="good">'+safe(r.net_pct)+'</td><td>'+safe(r.estimated_net_quote)+'</td><td>'+safe(r.mode)+'</td></tr>').join('')||'<tr><td colspan="7">No qualifying opportunities</td></tr>';
+document.getElementById('events').innerHTML=e.map(x=>'<div><b>'+safe(x.level)+'</b> '+safe(x.created_at)+' — '+safe(x.message)+'</div>').join('')||'No events';
+if(s.last_error) document.getElementById('events').innerHTML='<div class="warn">Last error: '+safe(s.last_error)+'</div>'+document.getElementById('events').innerHTML;
 }
 async function act(a){await fetch('/api/'+a,{method:'POST'});refresh()}
 refresh();setInterval(refresh,3000);
