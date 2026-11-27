@@ -1,4 +1,4 @@
-"""Cross-exchange BTC spread scanner. Paper-only by design."""
+"""Cross-exchange scanner using order-book depth. PAPER-only."""
 import asyncio
 import logging
 import os
@@ -8,6 +8,27 @@ from typing import Any
 import ccxt.async_support as ccxt
 
 log = logging.getLogger("arb.engine")
+
+
+def _consume(levels, target_qty):
+    """Return VWAP and filled base quantity by walking an order-book side."""
+    remaining = target_qty
+    quote_total = 0.0
+    filled = 0.0
+    for price, amount in levels:
+        price, amount = float(price), float(amount)
+        if price <= 0 or amount <= 0:
+            continue
+        take = min(remaining, amount)
+        quote_total += take * price
+        filled += take
+        remaining -= take
+        if remaining <= 1e-12:
+            break
+    if remaining > 1e-12 or filled <= 0:
+        return None
+    return quote_total / filled, filled
+
 
 class MarketEngine:
     def __init__(self, store):
@@ -19,6 +40,7 @@ class MarketEngine:
         self.fee = float(os.getenv("ESTIMATED_TAKER_FEE_PCT", "0.10")) / 100
         self.quote_size = float(os.getenv("ORDER_SIZE_QUOTE", "25"))
         self.interval = max(2, int(os.getenv("SCAN_INTERVAL_SECONDS", "5")))
+        self.max_book_age_ms = max(1000, int(os.getenv("MAX_BOOK_AGE_MS", "10000")))
         self.exchanges: dict[str, Any] = {}
         self.paused = False
         self.running = False
@@ -27,8 +49,11 @@ class MarketEngine:
         self.scan_count = 0
         self.opportunity_count = 0
         self.started = time.time()
+        self._loop_task = None
 
     async def start(self):
+        if self.running:
+            return
         self.running = True
         for exchange_id in self.exchange_ids:
             try:
@@ -40,15 +65,22 @@ class MarketEngine:
             except Exception as exc:
                 self.last_error = f"{exchange_id}: {exc}"
                 self.store.event("ERROR", "Exchange initialization failed", {"exchange": exchange_id, "error": str(exc)})
-        asyncio.create_task(self._loop())
+        self._loop_task = asyncio.create_task(self._loop())
 
     async def stop(self):
         self.running = False
+        if self._loop_task:
+            self._loop_task.cancel()
+            try:
+                await self._loop_task
+            except asyncio.CancelledError:
+                pass
         for ex in self.exchanges.values():
             try:
                 await ex.close()
             except Exception:
-                pass
+                log.exception("exchange close failed")
+        self.exchanges.clear()
 
     async def _loop(self):
         while self.running:
@@ -70,43 +102,58 @@ class MarketEngine:
                 if symbol not in ex.markets or not ex.markets[symbol].get("active", True):
                     continue
                 try:
-                    ob = await ex.fetch_order_book(symbol, limit=5)
+                    ob = await ex.fetch_order_book(symbol, limit=20)
+                    timestamp = ob.get("timestamp")
+                    age_ms = max(0, int(time.time() * 1000 - timestamp)) if timestamp else None
+                    if age_ms is not None and age_ms > self.max_book_age_ms:
+                        self.store.event("WARN", "Discarded stale order book", {"exchange": exchange_id, "symbol": symbol, "age_ms": age_ms})
+                        continue
                     if ob.get("asks") and ob.get("bids"):
-                        books[(exchange_id, symbol)] = {
-                            "ask": float(ob["asks"][0][0]), "ask_qty": float(ob["asks"][0][1]),
-                            "bid": float(ob["bids"][0][0]), "bid_qty": float(ob["bids"][0][1]),
-                        }
-                except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout) as exc:
-                    self.store.event("WARN", "Transient market data error", {"exchange": exchange_id, "symbol": symbol, "error": str(exc)})
+                        books[(exchange_id, symbol)] = {"asks": ob["asks"], "bids": ob["bids"], "age_ms": age_ms}
                 except ccxt.BaseError as exc:
-                    self.store.event("WARN", "Exchange rejected market data request", {"exchange": exchange_id, "symbol": symbol, "error": str(exc)})
+                    self.store.event("WARN", "Market data request failed", {"exchange": exchange_id, "symbol": symbol, "error": str(exc)})
         now = time.time()
         self.last_scan = now
         self.scan_count += 1
+
         for symbol in self.symbols:
-            venues = [(eid, b) for (eid, sym), b in books.items() if sym == symbol]
+            venues = [(eid, book) for (eid, sym), book in books.items() if sym == symbol]
             for buy_id, buy in venues:
                 for sell_id, sell in venues:
-                    if buy_id == sell_id or buy["ask"] <= 0:
+                    if buy_id == sell_id:
                         continue
-                    base_qty = self.quote_size / buy["ask"]
-                    if base_qty > min(buy["ask_qty"], sell["bid_qty"]):
+                    best_ask = float(buy["asks"][0][0])
+                    if best_ask <= 0:
                         continue
-                    gross = (sell["bid"] - buy["ask"]) / buy["ask"]
-                    net = gross - (2 * self.fee) - self.slippage
-                    if net <= 0:
+                    target_qty = self.quote_size / best_ask
+                    buy_fill = _consume(buy["asks"], target_qty)
+                    sell_fill = _consume(sell["bids"], target_qty)
+                    if not buy_fill or not sell_fill:
+                        continue
+                    buy_vwap, filled_qty = buy_fill
+                    sell_vwap, _ = sell_fill
+                    buy_cost = buy_vwap * filled_qty
+                    sell_value = sell_vwap * filled_qty
+                    gross_quote = sell_value - buy_cost
+                    gross = gross_quote / buy_cost if buy_cost else 0
+                    fees_quote = (buy_cost + sell_value) * self.fee
+                    slippage_quote = (buy_cost + sell_value) * self.slippage / 2
+                    net_quote = gross_quote - fees_quote - slippage_quote
+                    net = net_quote / buy_cost if buy_cost else 0
+                    if net < self.min_edge:
                         continue
                     row = {
                         "symbol": symbol, "buy_exchange": buy_id, "sell_exchange": sell_id,
-                        "buy_ask": buy["ask"], "sell_bid": sell["bid"],
-                        "gross_pct": round(gross * 100, 5), "net_pct": round(net * 100, 5),
-                        "quote_size": self.quote_size, "estimated_net_quote": round(self.quote_size * net, 6),
-                        "mode": "PAPER", "timestamp": now
+                        "buy_vwap": round(buy_vwap, 10), "sell_vwap": round(sell_vwap, 10),
+                        "base_qty": round(filled_qty, 12), "gross_pct": round(gross * 100, 6),
+                        "net_pct": round(net * 100, 6), "quote_size": round(buy_cost, 8),
+                        "estimated_net_quote": round(net_quote, 8), "mode": "PAPER",
+                        "buy_book_age_ms": buy["age_ms"], "sell_book_age_ms": sell["age_ms"],
+                        "timestamp": now,
                     }
                     self.opportunity_count += 1
                     self.store.opportunity(row)
-                    if net >= self.min_edge:
-                        self.store.event("OPPORTUNITY", "Paper opportunity after estimated fees and slippage", row)
+                    self.store.event("OPPORTUNITY", "Paper candidate passed net edge and visible depth", row)
 
     def status(self):
         return {
@@ -115,5 +162,5 @@ class MarketEngine:
             "last_scan": self.last_scan, "last_error": self.last_error,
             "scan_count": self.scan_count, "opportunity_count": self.opportunity_count,
             "uptime_seconds": int(time.time() - self.started),
-            "min_net_edge_pct": self.min_edge * 100, "order_size_quote": self.quote_size
+            "min_net_edge_pct": self.min_edge * 100, "order_size_quote": self.quote_size,
         }
