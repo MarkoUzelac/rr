@@ -5,7 +5,7 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from dotenv import load_dotenv
 from app.engine import MarketEngine
@@ -33,6 +33,12 @@ async def lifespan(app):
 
 app = FastAPI(title="Crypto Arbitrage Monitor", version="0.1.0", lifespan=lifespan)
 
+CONTROL_TOKEN = os.getenv("DASHBOARD_CONTROL_TOKEN", "").strip()
+
+def require_control_token(token: str | None):
+    if not CONTROL_TOKEN or not token or token != CONTROL_TOKEN:
+        raise HTTPException(status_code=401, detail="Dashboard control token required")
+
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return HTMLResponse((Path(__file__).parent / "static" / "index.html").read_text())
@@ -50,12 +56,14 @@ async def events():
     return JSONResponse(store.latest_events(100))
 
 @app.post("/api/pause")
-async def pause():
+async def pause(x_control_token: str | None = Header(default=None)):
+    require_control_token(x_control_token)
     engine.paused = True
     return {"paused": True}
 
 @app.post("/api/resume")
-async def resume():
+async def resume(x_control_token: str | None = Header(default=None)):
+    require_control_token(x_control_token)
     engine.paused = False
     return {"paused": False}
 
